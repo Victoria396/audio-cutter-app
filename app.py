@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 from faster_whisper import WhisperModel
 from pydub import AudioSegment
+from pydub.exceptions import CouldntDecodeError
 
 
 st.set_page_config(page_title="Audio Cutter", layout="wide")
@@ -18,6 +19,22 @@ CHUNKS_DIR = WORKDIR / "chunks"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 CUTS_DIR.mkdir(parents=True, exist_ok=True)
 CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def init_state():
+    st.session_state.setdefault("cuts_editor_version", 0)
+    st.session_state.setdefault("manual_editor_version", 0)
+
+
+def bump_cuts_editor():
+    st.session_state["cuts_editor_version"] += 1
+
+
+def bump_manual_editor():
+    st.session_state["manual_editor_version"] += 1
+
+
+init_state()
 
 
 @st.cache_resource
@@ -41,8 +58,13 @@ def save_uploaded_file(uploaded_file) -> Path:
 
 
 def get_audio_duration(path: Path) -> float:
-    audio = AudioSegment.from_file(path)
-    return len(audio) / 1000
+    try:
+        audio = AudioSegment.from_file(path)
+        return len(audio) / 1000
+    except CouldntDecodeError as e:
+        raise ValueError(
+            "FFmpeg не смог прочитать файл. Файл повреждён или не является настоящим аудио."
+        ) from e
 
 
 def split_audio_to_chunks(audio_path: Path, chunk_minutes: int = 10):
@@ -142,7 +164,63 @@ def safe_filename(name: str) -> str:
     return name.strip() or "clip"
 
 
+def apply_editor_changes(base_df: pd.DataFrame, editor_key: str) -> pd.DataFrame:
+    """
+    Применяет изменения st.data_editor к базовому DataFrame.
+
+    Важно:
+    - base_df не перезаписывается результатом data_editor на каждом rerun;
+    - изменения читаются из st.session_state[editor_key];
+    - это убирает баг "изменение сохраняется только со второго раза".
+    """
+    df = base_df.copy().reset_index(drop=True)
+
+    state = st.session_state.get(editor_key)
+
+    if not isinstance(state, dict):
+        return df
+
+    edited_rows = state.get("edited_rows", {})
+    added_rows = state.get("added_rows", [])
+    deleted_rows = state.get("deleted_rows", [])
+
+    for row_idx in sorted(deleted_rows, reverse=True):
+        try:
+            row_idx = int(row_idx)
+        except Exception:
+            continue
+
+        if 0 <= row_idx < len(df):
+            df = df.drop(df.index[row_idx]).reset_index(drop=True)
+
+    for row_idx, changes in edited_rows.items():
+        try:
+            row_idx = int(row_idx)
+        except Exception:
+            continue
+
+        if 0 <= row_idx < len(df):
+            for col, value in changes.items():
+                if col in df.columns:
+                    df.at[row_idx, col] = value
+
+    if added_rows:
+        added_df = pd.DataFrame(added_rows)
+
+        for col in df.columns:
+            if col not in added_df.columns:
+                added_df[col] = None
+
+        added_df = added_df[df.columns]
+        df = pd.concat([df, added_df], ignore_index=True)
+
+    return df.reset_index(drop=True)
+
+
 def make_segments_from_markers(df: pd.DataFrame, duration: float):
+    if df.empty or "cut_here" not in df.columns:
+        return pd.DataFrame(columns=["title", "start", "end"])
+
     selected = df[df["cut_here"] == True].copy()
 
     markers = []
@@ -164,10 +242,7 @@ def make_segments_from_markers(df: pd.DataFrame, duration: float):
     segments = []
 
     for i, start in enumerate(markers):
-        if i + 1 < len(markers):
-            end = markers[i + 1]
-        else:
-            end = duration
+        end = markers[i + 1] if i + 1 < len(markers) else duration
 
         if end <= start:
             continue
@@ -186,7 +261,10 @@ def make_segments_from_markers(df: pd.DataFrame, duration: float):
 def normalize_manual_segments(df: pd.DataFrame, duration: float):
     segments = []
 
-    for i, row in df.iterrows():
+    if df.empty:
+        return segments
+
+    for _, row in df.iterrows():
         try:
             title = str(row.get("title", "")).strip()
             start = float(row["start"])
@@ -211,8 +289,7 @@ def normalize_manual_segments(df: pd.DataFrame, duration: float):
             }
         )
 
-    segments = sorted(segments, key=lambda x: x["start"])
-    return segments
+    return sorted(segments, key=lambda x: x["start"])
 
 
 def cut_audio(audio_path: Path, segments):
@@ -257,7 +334,12 @@ file = st.file_uploader(
 
 if file:
     path = save_uploaded_file(file)
-    duration = get_audio_duration(path)
+
+    try:
+        duration = get_audio_duration(path)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
 
     st.write(f"Длительность: **{round(duration / 60, 1)} мин**")
     st.audio(str(path))
@@ -270,11 +352,17 @@ if file:
     )
 
     if st.button("Расшифровать всё аудио по частям", type="primary"):
-        st.session_state.pop("files", None)
-        st.session_state.pop("zip", None)
-        st.session_state.pop("cuts_table_editor", None)
-        st.session_state.pop("manual_segments_editor", None)
-        st.session_state.pop("manual_segments", None)
+        for key in [
+            "files",
+            "zip",
+            "cuts_table_base",
+            "manual_segments_base",
+            "text",
+        ]:
+            st.session_state.pop(key, None)
+
+        bump_cuts_editor()
+        bump_manual_editor()
 
         with st.spinner("Идёт транскрибация..."):
             rows, text = transcribe_long_audio(
@@ -282,10 +370,22 @@ if file:
                 chunk_minutes=chunk_minutes,
             )
 
-        st.session_state["text"] = text
-        st.session_state["cuts_table"] = pd.DataFrame(rows)
+        cuts_table = pd.DataFrame(rows)
 
-    if "cuts_table" in st.session_state:
+        if not cuts_table.empty:
+            cuts_table["cut_here"] = cuts_table["cut_here"].astype(bool)
+            cuts_table["start"] = cuts_table["start"].astype(float)
+            cuts_table["end"] = cuts_table["end"].astype(float)
+            cuts_table["text"] = cuts_table["text"].astype(str)
+
+        st.session_state["text"] = text
+        st.session_state["cuts_table_base"] = cuts_table
+
+        bump_cuts_editor()
+        bump_manual_editor()
+        st.rerun()
+
+    if "cuts_table_base" in st.session_state:
         st.subheader("1. Транскрипт и точки начала клипов")
 
         st.download_button(
@@ -306,22 +406,27 @@ if file:
 
         with col1:
             if st.button("Снять выбор со всех"):
-                st.session_state["cuts_table"]["cut_here"] = False
-                st.session_state.pop("cuts_table_editor", None)
-                st.session_state.pop("manual_segments", None)
-                st.session_state.pop("manual_segments_editor", None)
+                df = st.session_state["cuts_table_base"].copy()
+                df["cut_here"] = False
+                st.session_state["cuts_table_base"] = df
+                st.session_state.pop("manual_segments_base", None)
+
+                bump_cuts_editor()
+                bump_manual_editor()
                 st.rerun()
 
         with col2:
             if st.button("Поставить точку в начале первой фразы"):
-                if len(st.session_state["cuts_table"]) > 0:
-                    st.session_state["cuts_table"].loc[
-                        st.session_state["cuts_table"].index[0],
-                        "cut_here",
-                    ] = True
-                st.session_state.pop("cuts_table_editor", None)
-                st.session_state.pop("manual_segments", None)
-                st.session_state.pop("manual_segments_editor", None)
+                df = st.session_state["cuts_table_base"].copy()
+
+                if len(df) > 0:
+                    df.loc[df.index[0], "cut_here"] = True
+
+                st.session_state["cuts_table_base"] = df
+                st.session_state.pop("manual_segments_base", None)
+
+                bump_cuts_editor()
+                bump_manual_editor()
                 st.rerun()
 
         st.info(
@@ -329,13 +434,16 @@ if file:
             "После выбора точек ниже появится таблица итоговых клипов, где можно вручную менять начало, конец и название."
         )
 
-        edited_df = st.data_editor(
-            st.session_state["cuts_table"],
-            key="cuts_table_editor",
-            num_rows="dynamic",
+        cuts_key = f"cuts_table_editor_{st.session_state['cuts_editor_version']}"
+
+        st.data_editor(
+            st.session_state["cuts_table_base"],
+            key=cuts_key,
+            num_rows="fixed",
             use_container_width=True,
             hide_index=True,
             column_order=["cut_here", "start", "end", "text"],
+            disabled=["start", "end", "text"],
             column_config={
                 "cut_here": st.column_config.CheckboxColumn(
                     "Начать клип здесь",
@@ -347,7 +455,6 @@ if file:
                     max_value=duration,
                     step=0.1,
                     format="%.2f",
-                    disabled=True,
                 ),
                 "end": st.column_config.NumberColumn(
                     "Конец фразы",
@@ -355,18 +462,22 @@ if file:
                     max_value=duration,
                     step=0.1,
                     format="%.2f",
-                    disabled=True,
                 ),
-                "text": st.column_config.TextColumn(
-                    "Текст",
-                    disabled=True,
-                ),
+                "text": st.column_config.TextColumn("Текст"),
             },
         )
 
-        st.session_state["cuts_table"] = edited_df.copy()
+        current_cuts_df = apply_editor_changes(
+            st.session_state["cuts_table_base"],
+            cuts_key,
+        )
 
-        generated_segments_df = make_segments_from_markers(edited_df, duration)
+        if not current_cuts_df.empty:
+            current_cuts_df["cut_here"] = (
+                current_cuts_df["cut_here"].fillna(False).astype(bool)
+            )
+
+        generated_segments_df = make_segments_from_markers(current_cuts_df, duration)
 
         st.subheader("2. Итоговые клипы — можно редактировать вручную")
 
@@ -374,24 +485,38 @@ if file:
 
         with col_a:
             if st.button("Сформировать клипы из выбранных точек"):
-                st.session_state["manual_segments"] = generated_segments_df.copy()
-                st.session_state.pop("manual_segments_editor", None)
+                st.session_state["cuts_table_base"] = current_cuts_df.copy()
+                st.session_state["manual_segments_base"] = generated_segments_df.copy()
+
+                bump_cuts_editor()
+                bump_manual_editor()
                 st.rerun()
 
         with col_b:
             if st.button("Создать один клип на весь файл"):
-                st.session_state["manual_segments"] = pd.DataFrame(
-                    [{"title": "full_audio", "start": 0.0, "end": round(duration, 3)}]
+                st.session_state["cuts_table_base"] = current_cuts_df.copy()
+                st.session_state["manual_segments_base"] = pd.DataFrame(
+                    [
+                        {
+                            "title": "full_audio",
+                            "start": 0.0,
+                            "end": round(duration, 3),
+                        }
+                    ]
                 )
-                st.session_state.pop("manual_segments_editor", None)
+
+                bump_cuts_editor()
+                bump_manual_editor()
                 st.rerun()
 
-        if "manual_segments" not in st.session_state:
-            st.session_state["manual_segments"] = generated_segments_df.copy()
+        if "manual_segments_base" not in st.session_state:
+            st.session_state["manual_segments_base"] = generated_segments_df.copy()
 
-        manual_df = st.data_editor(
-            st.session_state["manual_segments"],
-            key="manual_segments_editor",
+        manual_key = f"manual_segments_editor_{st.session_state['manual_editor_version']}"
+
+        st.data_editor(
+            st.session_state["manual_segments_base"],
+            key=manual_key,
             num_rows="dynamic",
             use_container_width=True,
             hide_index=True,
@@ -418,9 +543,12 @@ if file:
             },
         )
 
-        st.session_state["manual_segments"] = manual_df.copy()
+        current_manual_df = apply_editor_changes(
+            st.session_state["manual_segments_base"],
+            manual_key,
+        )
 
-        segments = normalize_manual_segments(manual_df, duration)
+        segments = normalize_manual_segments(current_manual_df, duration)
 
         st.write(f"Валидных клипов: **{len(segments)}**")
 
@@ -433,11 +561,18 @@ if file:
             if not segments:
                 st.error("Нет валидных клипов. Проверь start/end.")
             else:
+                st.session_state["cuts_table_base"] = current_cuts_df.copy()
+                st.session_state["manual_segments_base"] = current_manual_df.copy()
+
+                bump_cuts_editor()
+                bump_manual_editor()
+
                 with st.spinner("Нарезка аудио..."):
                     files, zip_path = cut_audio(path, segments)
 
                 st.session_state["files"] = files
                 st.session_state["zip"] = zip_path
+                st.rerun()
 
     if "files" in st.session_state:
         st.subheader("Предпрослушивание и скачивание")
@@ -450,7 +585,7 @@ if file:
                 f"Скачать {f.name}",
                 read_bytes(f),
                 file_name=f.name,
-                mime="audio/mp3",
+                mime="audio/mpeg",
             )
 
         st.download_button(
